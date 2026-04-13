@@ -27,9 +27,12 @@ def setup_environment():
             "matplotlib"
         ]
         
+        # Do NOT use -U (upgrade). Kaggle's pre-installed PyTorch is compiled
+        # for P100 (sm_60). Upgrading any dep can pull a newer PyTorch that
+        # drops sm_60 support and causes "no kernel image" CUDA errors.
         for pkg in pkgs:
             try:
-                subprocess.run([sys.executable, "-m", "pip", "install", "-U", pkg, "-q"], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
             except Exception as e:
                 print(f"   Warning: Failed to install {pkg}: {e}")
         
