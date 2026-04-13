@@ -29,12 +29,16 @@ def setup_environment():
         
         for pkg in pkgs:
             try:
-                subprocess.run(f"{sys.executable} -m pip install -U '{pkg}' -q", shell=True, check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", "-U", pkg, "-q"], check=True)
             except Exception as e:
                 print(f"   Warning: Failed to install {pkg}: {e}")
         
-        # trl must be force-reinstalled to downgrade from Kaggle's pre-installed 1.x
-        subprocess.run(f"{sys.executable} -m pip install --force-reinstall 'trl==0.8.6' -q", shell=True, check=True)
+        # trl must be pinned to 0.8.6 (DDPOTrainer was removed in 1.x).
+        # Use --no-deps to avoid reinstalling/breaking diffusers.
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "trl==0.8.6", "--no-deps", "-q"], check=True)
+        except Exception as e:
+            print(f"   Warning: Failed to install trl==0.8.6: {e}")
         
         print(">> Dependencies installed successfully.")
     else:
