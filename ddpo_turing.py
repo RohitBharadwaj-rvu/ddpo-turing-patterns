@@ -1,5 +1,47 @@
 import os
+import sys
+import subprocess
 import time
+
+# =============================================================================
+# 0. Environment Setup (Kaggle/Colab Bootstrap)
+# =============================================================================
+
+def setup_environment():
+    """Detects environment and installs dependencies if needed."""
+    is_kaggle = "KAGGLE_URL_BASE" in os.environ
+    is_colab = "COLAB_GPU" in os.environ
+    
+    if is_kaggle or is_colab:
+        print(f">> Detected {'Kaggle' if is_kaggle else 'Colab'} environment.")
+        print(">> Checking/Installing dependencies (this may take a minute)...")
+        
+        pkgs = [
+            "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118",
+            "accelerate",
+            "transformers",
+            "diffusers",
+            "trl",
+            "peft",
+            "bitsandbytes",
+            "xformers",
+            "datasets"
+        ]
+        
+        for pkg in pkgs:
+            try:
+                subprocess.run(f"{sys.executable} -m pip install -U {pkg} -q", shell=True, check=True)
+            except Exception as e:
+                print(f"   Warning: Failed to install {pkg}: {e}")
+        
+        print(">> Dependencies installed successfully.")
+    else:
+        print(">> Local/Standard environment detected. Skipping auto-install.")
+
+# Run setup before any heavy imports
+setup_environment()
+
+# Now safe to import heavy hitters
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -178,40 +220,74 @@ def main():
     except Exception as e:
         print("   Proceeding without explicit xformers/checkpointing toggles:", e)
 
-    # 3. Setup Time-Aware Training Loop
+    import json
+    
+    # 3. Setup Time-Aware and Resume Training Loop
     MAX_RUNTIME_HOURS = 28.0
     SAFETY_MARGIN = 0.25 # Break 15 mins early to save weights securely
     MAX_RUNTIME_SECONDS = (MAX_RUNTIME_HOURS - SAFETY_MARGIN) * 3600
     START_TIME = time.time()
     
+    CHECKPOINT_DIR = "./working/checkpoint_latest"
+    start_epoch = 0
+    
+    if os.path.exists(CHECKPOINT_DIR):
+        print(f">> Found existing checkpoint at {CHECKPOINT_DIR}. Resuming...")
+        try:
+            # We explicitly load the accelerator state which includes Optimizer momentum
+            trainer.accelerator.load_state(CHECKPOINT_DIR)
+            
+            # Read metadata to resume epoch counter
+            with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "r") as f:
+                meta = json.load(f)
+                start_epoch = meta.get("epoch", 0) + 1
+            print(f"   Successfully loaded state. Resuming from Epoch {start_epoch}.")
+        except Exception as e:
+            print(f"   Failed to load checkpoint state: {e}. Starting fresh.")
+    
     print(f">> Starting Time-Aware DDPO Loop. Max execution time: {MAX_RUNTIME_HOURS - SAFETY_MARGIN} hrs.")
     
     try:
-        for epoch in range(config.num_epochs):
+        for epoch in range(start_epoch, config.num_epochs):
             elapsed = time.time() - START_TIME
             
             if elapsed >= MAX_RUNTIME_SECONDS:
                 print(f"\n>> Time limit reached: {elapsed/3600:.2f} hrs. Safely breaking loop to save final weights.")
                 break
                 
-            print(f"--- Epoch {epoch+1} | Time Elapsed: {elapsed/3600:.2f} hrs ---")
+            print(f"--- Epoch {epoch} | Time Elapsed: {elapsed/3600:.2f} hrs ---")
             
             # Step executes the environment rollout and policy unrolling
             trainer.step(epoch, epoch)
             
             # Checkpoint roughly every 5 epochs
             if (epoch + 1) % 5 == 0:
-                ckpt_path = f"./working/ddpo_turing_epoch_{epoch+1}"
+                ckpt_path = f"./working/ddpo_turing_epoch_{epoch}"
                 trainer.save_pretrained(ckpt_path)
                 print(f"   Saved checkpoint -> {ckpt_path}")
 
     except KeyboardInterrupt:
-        print("\n>> Interrupted by user. Catching to save weights...")
+        print("\n>> Stop button pressed! Safely Pausing & Saving State...")
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        # 1. Save standard model LoRA adapter
+        trainer.save_pretrained(CHECKPOINT_DIR)
+        # 2. Save accelerator state (Optimizers, Schedulers, RNG)
+        trainer.accelerator.save_state(CHECKPOINT_DIR)
+        # 3. Save our manual loop epoch metadata
+        with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "w") as f:
+            json.dump({"epoch": epoch}, f)
+        print(f">> State seamlessly saved at Epoch {epoch}. You can re-run this cell to resume.")
+        return # Exit the main function early, entirely skipping final push since we are "paused"
+
     finally:
-        # Final weights push
-        final_path = "./working/ddpo_turing_final"
-        trainer.save_pretrained(final_path)
-        print(f">> Finished execution. Full pipeline LORA saved to {final_path}")
+        # If we broke naturally (not interrupted), push final weights
+        # Note: If KeyboardInterrupt triggered, we bypass this block because of `return`. Wait! `finally` ALWAYS executes even with `return`.
+        pass
+        
+    # Final weights push (Only executes if we naturally finished or hit time limit)
+    final_path = f"./working/ddpo_turing_final_{int(time.time())}"
+    trainer.save_pretrained(final_path)
+    print(f">> Finished execution. Full pipeline LORA saved to {final_path}")
 
 if __name__ == "__main__":
     main()
