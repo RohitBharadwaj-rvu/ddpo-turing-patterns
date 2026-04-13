@@ -20,7 +20,6 @@ def setup_environment():
             "accelerate",
             "transformers",
             "diffusers",
-            "trl<=0.8.6",
             "peft",
             "bitsandbytes",
             "xformers",
@@ -33,6 +32,9 @@ def setup_environment():
                 subprocess.run(f"{sys.executable} -m pip install -U '{pkg}' -q", shell=True, check=True)
             except Exception as e:
                 print(f"   Warning: Failed to install {pkg}: {e}")
+        
+        # trl must be force-reinstalled to downgrade from Kaggle's pre-installed 1.x
+        subprocess.run(f"{sys.executable} -m pip install --force-reinstall 'trl==0.8.6' -q", shell=True, check=True)
         
         print(">> Dependencies installed successfully.")
     else:
