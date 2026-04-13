@@ -282,10 +282,10 @@ def main():
     # Optimizer
     try:
         import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=3e-5)
+        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=3e-4)
         print("   Using 8-bit AdamW optimizer.")
     except ImportError:
-        optimizer = torch.optim.AdamW(trainable_params, lr=3e-5)
+        optimizer = torch.optim.AdamW(trainable_params, lr=3e-4)
         print("   Using standard AdamW optimizer.")
 
     # ── Hyperparameters ──────────────────────────────────────────────────
@@ -295,7 +295,7 @@ def main():
     NUM_STEPS          = 20    # DDIM denoising steps
     GUIDANCE_SCALE     = 5.0
     ETA                = 1.0   # Must be >0 for valid log probs
-    CLIP_RANGE         = 1e-4  # PPO clip range
+    CLIP_RANGE         = 2e-3  # PPO clip range (wider than 1e-4 for stronger signal)
     ADV_CLIP           = 5.0
 
     # ── Time-Aware + Resume ──────────────────────────────────────────────
