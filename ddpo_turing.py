@@ -428,9 +428,10 @@ def main():
             # ══════════ PHASE 3: TELEMETRY ══════════
             avg_loss = epoch_loss / max(n_updates, 1)
             avg_reward = all_rewards.mean().item()
+            grad_norm = sum(p.grad.norm().item() ** 2 for p in trainable_params if p.grad is not None) ** 0.5
             history["loss"].append(avg_loss)
             history["reward"].append(avg_reward)
-            print(f"   Loss: {avg_loss:.4f} | Reward: {avg_reward:.4f}")
+            print(f"   Loss: {avg_loss:.8f} | Reward: {avg_reward:.4f} | Grad Norm: {grad_norm:.4f}")
 
             try:
                 import matplotlib
