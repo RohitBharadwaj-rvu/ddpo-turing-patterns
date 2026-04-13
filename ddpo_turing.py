@@ -30,7 +30,7 @@ def setup_environment():
         
         for pkg in pkgs:
             try:
-                subprocess.run(f"{sys.executable} -m pip install -U {pkg} -q", shell=True, check=True)
+                subprocess.run(f"{sys.executable} -m pip install -U '{pkg}' -q", shell=True, check=True)
             except Exception as e:
                 print(f"   Warning: Failed to install {pkg}: {e}")
         
