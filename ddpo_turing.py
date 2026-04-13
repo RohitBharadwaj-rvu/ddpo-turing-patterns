@@ -17,11 +17,10 @@ def setup_environment():
         print(">> Checking/Installing dependencies (this may take a minute)...")
         
         pkgs = [
-            "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118",
             "accelerate",
             "transformers",
             "diffusers",
-            "trl",
+            "trl<=0.8.6",
             "peft",
             "bitsandbytes",
             "xformers",
