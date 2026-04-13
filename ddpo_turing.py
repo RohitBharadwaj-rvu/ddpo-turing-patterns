@@ -165,15 +165,33 @@ def run_sanity_checks():
 # 3. Main DDPO Training execution
 # =============================================================================
 
+prompt_iterator = None
+
+def get_prompt_iterator():
+    from datasets import load_dataset
+    print(">> Loading Gustavosta/Stable-Diffusion-Prompts dataset...")
+    # Load dataset, shuffle with a fixed seed 
+    dataset = load_dataset("Gustavosta/Stable-Diffusion-Prompts", split="train")
+    dataset = dataset.shuffle(seed=42)
+    def iterator():
+        for item in dataset:
+            yield item["Prompt"]
+    return iterator()
+
 def prompt_fn():
-    """Generates prompt/metadata tuples for DDPO."""
-    prompts = [
-        "A highly detailed Turing pattern",
-        "Reaction-diffusion texture",
-        "Intricate organic difference of gaussians"
-    ]
-    # randomly select
-    chosen = prompts[torch.randint(0, len(prompts), (1,)).item()]
+    """Generates prompt/metadata tuples for DDPO with zero repetition."""
+    global prompt_iterator
+    
+    if prompt_iterator is None:
+        prompt_iterator = get_prompt_iterator()
+    
+    try:
+        chosen = next(prompt_iterator)
+    except StopIteration:
+        print(">> Warning: Prompt dataset exhausted. Re-starting iterator.")
+        prompt_iterator = get_prompt_iterator()
+        chosen = next(prompt_iterator)
+        
     return chosen, {}
 
 def main():
