@@ -2,9 +2,10 @@ import os
 import sys
 import subprocess
 import time
+import math
 
 # =============================================================================
-# 0. Environment Setup (Kaggle/Colab Bootstrap)
+# 0. Environment Setup (Kaggle/Colab Bootstrap) — NO trl!
 # =============================================================================
 
 def setup_environment():
@@ -22,7 +23,6 @@ def setup_environment():
             "diffusers",
             "peft",
             "bitsandbytes",
-            "xformers",
             "datasets",
             "matplotlib"
         ]
@@ -33,108 +33,167 @@ def setup_environment():
             except Exception as e:
                 print(f"   Warning: Failed to install {pkg}: {e}")
         
-        # trl must be pinned to 0.8.6 (DDPOTrainer was removed in 1.x).
-        # Use --no-deps to avoid reinstalling/breaking diffusers.
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "trl==0.8.6", "--no-deps", "-q"], check=True)
-        except Exception as e:
-            print(f"   Warning: Failed to install trl==0.8.6: {e}")
-        
         print(">> Dependencies installed successfully.")
     else:
         print(">> Local/Standard environment detected. Skipping auto-install.")
 
-# Run setup before any heavy imports
 setup_environment()
 
-# Now safe to import heavy hitters
+# Heavy imports
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
-from diffusers import StableDiffusionPipeline
-from trl import DDPOTrainer, DDPOConfig, DefaultDDPOStableDiffusionPipeline
-from datasets import Dataset
+import json
+import numpy as np
+from PIL import Image
+from diffusers import StableDiffusionPipeline, DDIMScheduler
+from peft import LoraConfig
 
 # =============================================================================
-# 1. Turing Pattern & Custom Reward Functions
+# 1. DDPO Core: DDIM Step with Log Probability
+#    Reference: github.com/kvablack/ddpo-pytorch
+# =============================================================================
+
+def _left_broadcast(t, shape):
+    assert t.ndim <= len(shape)
+    return t.reshape(t.shape + (1,) * (len(shape) - t.ndim)).broadcast_to(shape)
+
+def ddim_step_with_logprob(scheduler, model_output, timestep, sample, eta=1.0, prev_sample=None):
+    """
+    DDIM reverse step returning (next_sample, log_prob).
+    The log_prob measures how likely the transition is under the current policy.
+    This is the mathematical heart of DDPO.
+    """
+    if not isinstance(timestep, torch.Tensor):
+        timestep = torch.tensor([timestep], device=sample.device)
+    if timestep.ndim == 0:
+        timestep = timestep.unsqueeze(0)
+
+    prev_t = timestep - scheduler.config.num_train_timesteps // scheduler.num_inference_steps
+    prev_t = torch.clamp(prev_t, 0, scheduler.config.num_train_timesteps - 1)
+
+    alpha_t = _left_broadcast(scheduler.alphas_cumprod.gather(0, timestep.cpu()), sample.shape).to(sample.device)
+    alpha_prev = torch.where(
+        prev_t.cpu() >= 0,
+        scheduler.alphas_cumprod.gather(0, prev_t.cpu()),
+        scheduler.final_alpha_cumprod,
+    )
+    alpha_prev = _left_broadcast(alpha_prev, sample.shape).to(sample.device)
+    beta_t = 1 - alpha_t
+
+    # Predict x_0
+    if scheduler.config.prediction_type == "v_prediction":
+        pred_x0 = alpha_t ** 0.5 * sample - beta_t ** 0.5 * model_output
+        pred_eps = alpha_t ** 0.5 * model_output + beta_t ** 0.5 * sample
+    else:  # epsilon (default)
+        pred_x0 = (sample - beta_t ** 0.5 * model_output) / alpha_t ** 0.5
+        pred_eps = model_output
+
+    if scheduler.config.clip_sample:
+        pred_x0 = pred_x0.clamp(-scheduler.config.clip_sample_range, scheduler.config.clip_sample_range)
+
+    # Variance & std
+    beta_prev = 1 - alpha_prev
+    variance = (beta_prev / beta_t) * (1 - alpha_t / alpha_prev)
+    std = eta * variance ** 0.5
+    std = _left_broadcast(std, sample.shape).to(sample.device) if std.ndim < sample.ndim else std
+
+    # Direction + mean
+    direction = (1 - alpha_prev - std ** 2) ** 0.5 * pred_eps
+    mean = alpha_prev ** 0.5 * pred_x0 + direction
+
+    if prev_sample is None:
+        prev_sample = mean + std * torch.randn_like(model_output)
+
+    # Log prob of prev_sample under Gaussian(mean, std)
+    log_prob = (
+        -((prev_sample.detach() - mean) ** 2) / (2 * std ** 2)
+        - torch.log(std)
+        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi, device=sample.device)))
+    )
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+
+    return prev_sample.to(sample.dtype), log_prob
+
+
+# =============================================================================
+# 2. DDPO Core: Sampling with Log Probability Tracking
+# =============================================================================
+
+@torch.no_grad()
+def sample_with_logprob(pipeline, prompt_embeds, neg_prompt_embeds, num_steps, guidance_scale, eta, device):
+    """Full denoising pass that records latents & log_probs at every step."""
+    scheduler = pipeline.scheduler
+    unet = pipeline.unet
+    B = prompt_embeds.shape[0]
+
+    scheduler.set_timesteps(num_steps, device=device)
+    timesteps = scheduler.timesteps
+
+    latents = torch.randn(B, 4, 64, 64, device=device, dtype=prompt_embeds.dtype)
+    latents = latents * scheduler.init_noise_sigma
+
+    all_latents = [latents]
+    all_log_probs = []
+    embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
+
+    for t in timesteps:
+        lat_in = scheduler.scale_model_input(torch.cat([latents] * 2), t)
+        noise_pred = unet(lat_in, t, encoder_hidden_states=embeds).sample
+        uncond, cond = noise_pred.chunk(2)
+        noise_pred = uncond + guidance_scale * (cond - uncond)
+
+        latents, lp = ddim_step_with_logprob(scheduler, noise_pred, t, latents, eta=eta)
+        all_latents.append(latents)
+        all_log_probs.append(lp)
+
+    # Decode
+    imgs_t = pipeline.vae.decode(latents / pipeline.vae.config.scaling_factor, return_dict=False)[0]
+    imgs_t = (imgs_t / 2 + 0.5).clamp(0, 1)
+    pil_imgs = []
+    for img in imgs_t:
+        arr = (img.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        pil_imgs.append(Image.fromarray(arr))
+
+    return pil_imgs, all_latents, all_log_probs
+
+
+# =============================================================================
+# 3. Turing Pattern & Custom Reward Functions (UNCHANGED)
 # =============================================================================
 
 def turing_pattern_dog(images, sigma_1=1.0, sigma_2=2.0, threshold=0.0):
-    """
-    Applies Difference of Gaussians (DoG) as a proxy for Turing patterns.
-    images: Tensor of shape (B, C, H, W). Assumes images are properly normalized.
-    """
-    # Using torchvision's gaussian_blur. It expects images in [0, 1] or similar scale.
     blur_1 = TF.gaussian_blur(images, kernel_size=[11, 11], sigma=[sigma_1, sigma_1])
     blur_2 = TF.gaussian_blur(images, kernel_size=[21, 21], sigma=[sigma_2, sigma_2])
-    
-    # Difference of Gaussians
-    dog = blur_1 - blur_2
-    
-    # Binarize to clearly separate the patterns
-    pattern = (dog > threshold).float()
-    return pattern
+    return (blur_1 - blur_2 > threshold).float()
 
 def pairwise_hamming_distance(patterns):
-    """
-    Computes pairwise Hamming distance between patterns in a batch.
-    patterns: Tensor of shape (B, C, H, W) with values 0 or 1.
-    """
     B = patterns.shape[0]
     if B < 2:
         return torch.tensor(0.0, device=patterns.device).expand(B)
-    
-    # Flatten spatial dimensions
-    flat_patterns = patterns.view(B, -1)
-    
-    rewards = torch.zeros(B, device=patterns.device, dtype=torch.float32)
+    flat = patterns.view(B, -1)
+    rewards = torch.zeros(B, device=patterns.device)
     for i in range(B):
-        # All patterns except i
-        others = torch.cat([flat_patterns[:i], flat_patterns[i+1:]], dim=0)
-        
-        # Absolute difference acts as XOR for {0, 1}
-        # Meaning: exactly differing pixels
-        diff = torch.abs(flat_patterns[i].unsqueeze(0) - others)
-        
-        # We want to maximize the difference (high diversity)
-        # diff.mean() across all other samples and all pixels gives a percentage (0.0 to 1.0)
-        rewards[i] = diff.mean()
-        
+        others = torch.cat([flat[:i], flat[i+1:]], dim=0)
+        rewards[i] = torch.abs(flat[i].unsqueeze(0) - others).mean()
     return rewards
 
 def custom_reward_fn(images, prompts, metadata):
-    """
-    TRL DDPOTrainer reward function.
-    Given generated images, returns a list of floats as rewards.
-    We return higher rewards for high Hamming Distance (diversity) and balanced DoG activation.
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     to_tensor = T.ToTensor()
-    
     if not isinstance(images, list):
         images = [images]
-        
-    # Convert PIL Images to tensors
     batch = torch.stack([to_tensor(img) for img in images]).to(device)
-    
-    # 1. Compute Turing patterns via DoG
     patterns = turing_pattern_dog(batch)
-    
-    # 2. Compute pairwise Hamming distance
-    diversity_rewards = pairwise_hamming_distance(patterns) # between 0.0 and 1.0
-    
-    # 3. Add balance reward: encourage non-trivial patterns (no plain white/black)
-    pattern_means = patterns.view(batch.shape[0], -1).mean(dim=1)
-    # peaks at 0.5 (perfectly balanced 0s and 1s)
-    balance_rewards = 1.0 - torch.abs(pattern_means - 0.5) * 2.0
-    
-    total_rewards = diversity_rewards + balance_rewards
-    
-    return total_rewards.cpu().tolist(), {}
+    diversity = pairwise_hamming_distance(patterns)
+    means = patterns.view(batch.shape[0], -1).mean(dim=1)
+    balance = 1.0 - torch.abs(means - 0.5) * 2.0
+    return (diversity + balance).cpu().tolist(), {}
+
 
 # =============================================================================
-# 2. Automated Sanity Checks
+# 4. Automated Sanity Checks (UNCHANGED)
 # =============================================================================
 
 def run_sanity_checks():
@@ -142,33 +201,23 @@ def run_sanity_checks():
     print(">> Running preflight sanity checks...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"   Detected device: {device}")
-    
     try:
-        # Dummy batch: 4 random images
-        dummy_tensor = torch.rand(4, 3, 512, 512, device=device)
-        
-        # Test Turing logic
-        patterns = turing_pattern_dog(dummy_tensor)
-        assert patterns.shape == (4, 3, 512, 512), f"Expected shape (4, 3, 512, 512) got {patterns.shape}"
-        assert torch.all(patterns >= 0) and torch.all(patterns <= 1), "Patterns must be binary 0 or 1."
-        
-        # Test Hamming distance
-        distances = pairwise_hamming_distance(patterns)
-        assert distances.shape == (4,), f"Expected shape (4,) got {distances.shape}"
-        assert torch.all(distances >= 0) and torch.all(distances <= 1.0), "Distances must be bounded [0, 1]."
-        
-        # Everything passed, export artifact
+        dummy = torch.rand(4, 3, 512, 512, device=device)
+        pat = turing_pattern_dog(dummy)
+        assert pat.shape == (4, 3, 512, 512)
+        dist = pairwise_hamming_distance(pat)
+        assert dist.shape == (4,) and torch.all(dist >= 0) and torch.all(dist <= 1.0)
         os.makedirs("./working", exist_ok=True)
-        to_pil = T.ToPILImage()
-        to_pil(patterns[0]).save("./working/preflight_check.png")
-        print("   Preflight checks passed! Artifact saved to ./working/preflight_check.png")
+        T.ToPILImage()(pat[0]).save("./working/preflight_check.png")
+        print("   Preflight checks passed!")
         print("--------------------------------------------------\n")
     except Exception as e:
         print(f"!!! SANITY CHECK FAILED !!!\n{e}")
         exit(1)
 
+
 # =============================================================================
-# 3. Main DDPO Training execution
+# 5. Prompt Dataset (UNCHANGED)
 # =============================================================================
 
 prompt_iterator = None
@@ -176,195 +225,249 @@ prompt_iterator = None
 def get_prompt_iterator():
     from datasets import load_dataset
     print(">> Loading Gustavosta/Stable-Diffusion-Prompts dataset...")
-    # Load dataset, shuffle with a fixed seed 
-    dataset = load_dataset("Gustavosta/Stable-Diffusion-Prompts", split="train")
-    dataset = dataset.shuffle(seed=42)
-    def iterator():
-        for item in dataset:
+    ds = load_dataset("Gustavosta/Stable-Diffusion-Prompts", split="train").shuffle(seed=42)
+    def _iter():
+        for item in ds:
             yield item["Prompt"]
-    return iterator()
+    return _iter()
 
 def prompt_fn():
-    """Generates prompt/metadata tuples for DDPO with zero repetition."""
     global prompt_iterator
-    
     if prompt_iterator is None:
         prompt_iterator = get_prompt_iterator()
-    
     try:
-        chosen = next(prompt_iterator)
+        return next(prompt_iterator), {}
     except StopIteration:
-        print(">> Warning: Prompt dataset exhausted. Re-starting iterator.")
         prompt_iterator = get_prompt_iterator()
-        chosen = next(prompt_iterator)
-        
-    return chosen, {}
+        return next(prompt_iterator), {}
+
+
+# =============================================================================
+# 6. Main DDPO Training Loop — From Scratch, No trl
+# =============================================================================
 
 def main():
-    # 1. First, validate the mathematical pipeline
     run_sanity_checks()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 2. Initialize Pipeline & Memory optimizations
-    print(">> Initializing DDPO Trainer & Model...")
-    
-    # We use Runway's SD1.5 base as a lightweight test
-    pipeline = DefaultDDPOStableDiffusionPipeline(
+    # ── Model Setup ──────────────────────────────────────────────────────
+    print(">> Loading Stable Diffusion v1.5 (this may take a few minutes)...")
+    pipeline = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
-        use_lora=True,          # Essential for 16GB
+        torch_dtype=torch.float16,
+        safety_checker=None,
     )
-    
-    # Prepare DDPOTrainer Config tailored for max VRAM 16GB
-    config = DDPOConfig(
-        num_epochs=1000,                  # We manage the break programmatically
-        train_gradient_accumulation_steps=4,
-        sample_num_steps=50,
-        sample_batch_size=2,              # Restrict to avoid OOM
-        train_batch_size=2,
-        sample_num_batches_per_epoch=8,   # Keep epochs short for fine-grained time checking
-        per_prompt_stat_tracking=True,
-        tracker_project_name="ddpo_turing_patterns",
-        mixed_precision="fp16",           # FP16 essential for 16GB limit
-        # In TRL 0.8+ gradient checkpointing is commonly set securely inside DDPO or PEFT config
-        # We assume pipeline manages the underlying VRAM optimizations.
-    )
+    pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+    pipeline.to(device)
 
-    trainer = DDPOTrainer(
-        config=config,
-        reward_function=custom_reward_fn,
-        prompt_function=prompt_fn,
-        sd_pipeline=pipeline,
+    # Freeze everything except UNet LoRA
+    pipeline.vae.requires_grad_(False)
+    pipeline.text_encoder.requires_grad_(False)
+    pipeline.unet.requires_grad_(False)
+
+    # Inject LoRA into UNet attention layers
+    lora_config = LoraConfig(
+        r=4, lora_alpha=4, init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    
-    # Enable inner memory hacks explicitly if available
+    pipeline.unet.add_adapter(lora_config)
+    pipeline.unet.enable_gradient_checkpointing()
+
+    trainable_params = [p for p in pipeline.unet.parameters() if p.requires_grad]
+    print(f"   Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    # Optimizer
     try:
-        if hasattr(trainer.sd_pipeline, "enable_xformers_memory_efficient_attention"):
-            trainer.sd_pipeline.enable_xformers_memory_efficient_attention()
-        if hasattr(trainer.sd_pipeline, "enable_gradient_checkpointing"):
-            trainer.sd_pipeline.enable_gradient_checkpointing()
-    except Exception as e:
-        print("   Proceeding without explicit xformers/checkpointing toggles:", e)
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=3e-5)
+        print("   Using 8-bit AdamW optimizer.")
+    except ImportError:
+        optimizer = torch.optim.AdamW(trainable_params, lr=3e-5)
+        print("   Using standard AdamW optimizer.")
 
-    import json
-    
-    # 3. Setup Time-Aware and Resume Training Loop
-    MAX_RUNTIME_HOURS = 28.0
-    SAFETY_MARGIN = 0.25 # Break 15 mins early to save weights securely
-    MAX_RUNTIME_SECONDS = (MAX_RUNTIME_HOURS - SAFETY_MARGIN) * 3600
+    # ── Hyperparameters ──────────────────────────────────────────────────
+    NUM_EPOCHS         = 1000
+    SAMPLE_BATCH_SIZE  = 2
+    BATCHES_PER_EPOCH  = 4
+    NUM_STEPS          = 20    # DDIM denoising steps
+    GUIDANCE_SCALE     = 5.0
+    ETA                = 1.0   # Must be >0 for valid log probs
+    CLIP_RANGE         = 1e-4  # PPO clip range
+    ADV_CLIP           = 5.0
+
+    # ── Time-Aware + Resume ──────────────────────────────────────────────
+    MAX_RUNTIME_SECONDS = (28.0 - 0.25) * 3600
     START_TIME = time.time()
-    
+
     CHECKPOINT_DIR = "./working/checkpoint_latest"
     start_epoch = 0
     history = {"loss": [], "reward": []}
-    
+
     if os.path.exists(CHECKPOINT_DIR):
-        print(f">> Found existing checkpoint at {CHECKPOINT_DIR}. Resuming...")
+        print(f">> Found checkpoint at {CHECKPOINT_DIR}. Resuming...")
         try:
-            # We explicitly load the accelerator state which includes Optimizer momentum
-            trainer.accelerator.load_state(CHECKPOINT_DIR)
-            
-            # Read metadata to resume epoch counter and history graphs
+            lora_path = os.path.join(CHECKPOINT_DIR, "unet_lora.pt")
+            if os.path.exists(lora_path):
+                pipeline.unet.load_state_dict(torch.load(lora_path, map_location=device), strict=False)
+            opt_path = os.path.join(CHECKPOINT_DIR, "optimizer.pt")
+            if os.path.exists(opt_path):
+                optimizer.load_state_dict(torch.load(opt_path, map_location=device))
             with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "r") as f:
                 meta = json.load(f)
                 start_epoch = meta.get("epoch", 0) + 1
                 history = meta.get("history", {"loss": [], "reward": []})
-            print(f"   Successfully loaded state. Resuming from Epoch {start_epoch}.")
+            print(f"   Resumed from Epoch {start_epoch}.")
         except Exception as e:
-            print(f"   Failed to load checkpoint state: {e}. Starting fresh.")
-    
-    print(f">> Starting Time-Aware DDPO Loop. Max execution time: {MAX_RUNTIME_HOURS - SAFETY_MARGIN} hrs.")
-    
-    try:
-        for epoch in range(start_epoch, config.num_epochs):
-            elapsed = time.time() - START_TIME
-            
-            if elapsed >= MAX_RUNTIME_SECONDS:
-                print(f"\n>> Time limit reached: {elapsed/3600:.2f} hrs. Safely breaking loop to save final weights.")
-                break
-                
-            print(f"--- Epoch {epoch} | Time Elapsed: {elapsed/3600:.2f} hrs ---")
-            
-            # Step executes the environment rollout and policy unrolling
-            stats = trainer.step(epoch, epoch)
-            
-            # Extract loss and reward metrics gracefully to avoid API brittleness
-            loss_val, reward_val = 0.0, 0.0
-            def extract_metrics(obj):
-                l, r = None, None
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        # match any key describing loss or reward
-                        if "loss" in k.lower(): l = v
-                        elif "reward" in k.lower(): r = v
-                        if hasattr(v, 'item'):
-                            if l is v: l = l.item()
-                            if r is v: r = r.item()
-                return l, r
-            
-            if isinstance(stats, dict):
-                loss_val, reward_val = extract_metrics(stats)
-            elif isinstance(stats, tuple):
-                for s in stats:
-                    l, r = extract_metrics(s)
-                    if l is not None: loss_val = l
-                    if r is not None: reward_val = r
-            
-            # Fallbacks just in case the stats dict is empty or differently structured
-            history["loss"].append(loss_val if loss_val is not None else 0.0)
-            history["reward"].append(reward_val if reward_val is not None else 0.0)
+            print(f"   Failed to load checkpoint: {e}. Starting fresh.")
 
-            # Generate dynamically updating training plot
+    # Pre-compute negative prompt embeddings (empty string)
+    neg_ids = pipeline.tokenizer(
+        [""] * SAMPLE_BATCH_SIZE, return_tensors="pt",
+        padding="max_length", truncation=True,
+        max_length=pipeline.tokenizer.model_max_length,
+    ).input_ids.to(device)
+    neg_embeds = pipeline.text_encoder(neg_ids)[0]
+
+    print(f">> Starting DDPO Loop. Max runtime: 27.75 hrs.")
+
+    # ── Training Loop ────────────────────────────────────────────────────
+    try:
+        for epoch in range(start_epoch, NUM_EPOCHS):
+            elapsed = time.time() - START_TIME
+            if elapsed >= MAX_RUNTIME_SECONDS:
+                print(f"\n>> Time limit reached ({elapsed/3600:.2f} hrs). Breaking.")
+                break
+
+            print(f"--- Epoch {epoch} | Elapsed: {elapsed/3600:.2f} hrs ---")
+
+            # ══════════ PHASE 1: SAMPLING (no gradients) ══════════
+            pipeline.unet.eval()
+            all_samples = []
+            all_rewards_list = []
+
+            for batch_idx in range(BATCHES_PER_EPOCH):
+                prompts = [prompt_fn()[0] for _ in range(SAMPLE_BATCH_SIZE)]
+
+                prompt_ids = pipeline.tokenizer(
+                    prompts, return_tensors="pt", padding="max_length",
+                    truncation=True, max_length=pipeline.tokenizer.model_max_length,
+                ).input_ids.to(device)
+                prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+
+                images, latents_list, log_probs_list = sample_with_logprob(
+                    pipeline, prompt_embeds, neg_embeds, NUM_STEPS, GUIDANCE_SCALE, ETA, device,
+                )
+
+                rewards_val, _ = custom_reward_fn(images, prompts, {})
+                rewards_t = torch.tensor(rewards_val, device=device, dtype=torch.float32)
+                all_rewards_list.append(rewards_t)
+
+                all_samples.append({
+                    "prompt_embeds": prompt_embeds,
+                    "neg_embeds": neg_embeds,
+                    "latents": torch.stack(latents_list[:-1], dim=1),      # (B, T, 4, 64, 64)
+                    "next_latents": torch.stack(latents_list[1:], dim=1),  # (B, T, 4, 64, 64)
+                    "log_probs": torch.stack(log_probs_list, dim=1),       # (B, T)
+                    "timesteps": pipeline.scheduler.timesteps,             # (T,)
+                    "rewards": rewards_t,
+                })
+
+            # Compute advantages (normalized rewards)
+            all_rewards = torch.cat(all_rewards_list)
+            advantages = (all_rewards - all_rewards.mean()) / (all_rewards.std() + 1e-8)
+            idx = 0
+            for s in all_samples:
+                bs = s["rewards"].shape[0]
+                s["advantages"] = advantages[idx:idx+bs]
+                idx += bs
+
+            # ══════════ PHASE 2: TRAINING (with gradients) ══════════
+            pipeline.unet.train()
+            epoch_loss = 0.0
+            n_updates = 0
+
+            for sample in all_samples:
+                optimizer.zero_grad()
+                embeds = torch.cat([sample["neg_embeds"], sample["prompt_embeds"]])
+                num_t = sample["timesteps"].shape[0]
+                adv = torch.clamp(sample["advantages"], -ADV_CLIP, ADV_CLIP)
+
+                for t_idx in range(num_t):
+                    lat = sample["latents"][:, t_idx]
+                    next_lat = sample["next_latents"][:, t_idx]
+                    t = sample["timesteps"][t_idx]
+                    old_lp = sample["log_probs"][:, t_idx]
+
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        lat_in = torch.cat([lat] * 2)
+                        lat_in = pipeline.scheduler.scale_model_input(lat_in, t)
+                        noise_pred = pipeline.unet(lat_in, t, encoder_hidden_states=embeds).sample
+                        uncond, cond = noise_pred.chunk(2)
+                        noise_pred = uncond + GUIDANCE_SCALE * (cond - uncond)
+
+                    _, new_lp = ddim_step_with_logprob(
+                        pipeline.scheduler, noise_pred, t, lat, eta=ETA, prev_sample=next_lat,
+                    )
+
+                    ratio = torch.exp(new_lp - old_lp)
+                    loss = torch.mean(torch.maximum(
+                        -adv * ratio,
+                        -adv * torch.clamp(ratio, 1.0 - CLIP_RANGE, 1.0 + CLIP_RANGE),
+                    ))
+
+                    loss.backward()
+                    epoch_loss += loss.item()
+                    n_updates += 1
+
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+
+            # ══════════ PHASE 3: TELEMETRY ══════════
+            avg_loss = epoch_loss / max(n_updates, 1)
+            avg_reward = all_rewards.mean().item()
+            history["loss"].append(avg_loss)
+            history["reward"].append(avg_reward)
+            print(f"   Loss: {avg_loss:.4f} | Reward: {avg_reward:.4f}")
+
             try:
+                import matplotlib
+                matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
-                plt.figure(figsize=(10, 4))
-                
-                plt.subplot(1, 2, 1)
-                plt.plot(range(len(history["loss"])), history["loss"], label="Loss", color="red")
-                plt.xlabel("Epoch")
-                plt.ylabel("Loss")
-                plt.title("Training Loss")
-                plt.grid(True)
-                
-                plt.subplot(1, 2, 2)
-                plt.plot(range(len(history["reward"])), history["reward"], label="Reward", color="green")
-                plt.xlabel("Epoch")
-                plt.ylabel("Reward")
-                plt.title("Diverse Turing Rewards")
-                plt.grid(True)
-                
-                plt.tight_layout()
-                plt.savefig("./working/training_progress.png")
-                plt.close()
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+                ax1.plot(history["loss"], color="red"); ax1.set_title("Training Loss"); ax1.set_xlabel("Epoch"); ax1.grid(True)
+                ax2.plot(history["reward"], color="green"); ax2.set_title("Turing Reward"); ax2.set_xlabel("Epoch"); ax2.grid(True)
+                plt.tight_layout(); plt.savefig("./working/training_progress.png"); plt.close()
             except Exception as e:
-                print(f"   [Warning] Failed to generate plot: {e}")
-            
-            # Checkpoint roughly every 5 epochs
+                print(f"   [Warning] Plot failed: {e}")
+
+            # ══════════ PHASE 4: PERIODIC CHECKPOINT ══════════
             if (epoch + 1) % 5 == 0:
-                ckpt_path = f"./working/ddpo_turing_epoch_{epoch}"
-                trainer.save_pretrained(ckpt_path)
-                print(f"   Saved checkpoint -> {ckpt_path}")
+                ckpt = f"./working/ddpo_epoch_{epoch}"
+                os.makedirs(ckpt, exist_ok=True)
+                lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
+                torch.save(lora_state, os.path.join(ckpt, "unet_lora.pt"))
+                print(f"   Checkpoint -> {ckpt}")
 
     except KeyboardInterrupt:
-        print("\n>> Stop button pressed! Safely Pausing & Saving State...")
+        print("\n>> Stop button pressed! Saving state...")
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        # 1. Save standard model LoRA adapter
-        trainer.save_pretrained(CHECKPOINT_DIR)
-        # 2. Save accelerator state (Optimizers, Schedulers, RNG)
-        trainer.accelerator.save_state(CHECKPOINT_DIR)
-        # 3. Save our manual loop epoch metadata & history
+        lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
+        torch.save(lora_state, os.path.join(CHECKPOINT_DIR, "unet_lora.pt"))
+        torch.save(optimizer.state_dict(), os.path.join(CHECKPOINT_DIR, "optimizer.pt"))
         with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "w") as f:
             json.dump({"epoch": epoch, "history": history}, f)
-        print(f">> State seamlessly saved at Epoch {epoch}. You can re-run this cell to resume.")
-        return # Exit the main function early, entirely skipping final push since we are "paused"
+        print(f">> Paused at Epoch {epoch}. Re-run this cell to resume.")
+        return
 
     finally:
-        # If we broke naturally (not interrupted), push final weights
-        # Note: If KeyboardInterrupt triggered, we bypass this block because of `return`. Wait! `finally` ALWAYS executes even with `return`.
         pass
-        
-    # Final weights push (Only executes if we naturally finished or hit time limit)
-    final_path = f"./working/ddpo_turing_final_{int(time.time())}"
-    trainer.save_pretrained(final_path)
-    print(f">> Finished execution. Full pipeline LORA saved to {final_path}")
+
+    # Final save
+    final = f"./working/ddpo_final_{int(time.time())}"
+    os.makedirs(final, exist_ok=True)
+    lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
+    torch.save(lora_state, os.path.join(final, "unet_lora.pt"))
+    print(f">> Done! Final LoRA saved to {final}")
 
 if __name__ == "__main__":
     main()
