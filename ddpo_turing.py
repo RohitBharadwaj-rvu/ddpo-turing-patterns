@@ -25,7 +25,8 @@ def setup_environment():
             "peft",
             "bitsandbytes",
             "xformers",
-            "datasets"
+            "datasets",
+            "matplotlib"
         ]
         
         for pkg in pkgs:
@@ -248,6 +249,7 @@ def main():
     
     CHECKPOINT_DIR = "./working/checkpoint_latest"
     start_epoch = 0
+    history = {"loss": [], "reward": []}
     
     if os.path.exists(CHECKPOINT_DIR):
         print(f">> Found existing checkpoint at {CHECKPOINT_DIR}. Resuming...")
@@ -255,10 +257,11 @@ def main():
             # We explicitly load the accelerator state which includes Optimizer momentum
             trainer.accelerator.load_state(CHECKPOINT_DIR)
             
-            # Read metadata to resume epoch counter
+            # Read metadata to resume epoch counter and history graphs
             with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "r") as f:
                 meta = json.load(f)
                 start_epoch = meta.get("epoch", 0) + 1
+                history = meta.get("history", {"loss": [], "reward": []})
             print(f"   Successfully loaded state. Resuming from Epoch {start_epoch}.")
         except Exception as e:
             print(f"   Failed to load checkpoint state: {e}. Starting fresh.")
@@ -276,7 +279,58 @@ def main():
             print(f"--- Epoch {epoch} | Time Elapsed: {elapsed/3600:.2f} hrs ---")
             
             # Step executes the environment rollout and policy unrolling
-            trainer.step(epoch, epoch)
+            stats = trainer.step(epoch, epoch)
+            
+            # Extract loss and reward metrics gracefully to avoid API brittleness
+            loss_val, reward_val = 0.0, 0.0
+            def extract_metrics(obj):
+                l, r = None, None
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        # match any key describing loss or reward
+                        if "loss" in k.lower(): l = v
+                        elif "reward" in k.lower(): r = v
+                        if hasattr(v, 'item'):
+                            if l is v: l = l.item()
+                            if r is v: r = r.item()
+                return l, r
+            
+            if isinstance(stats, dict):
+                loss_val, reward_val = extract_metrics(stats)
+            elif isinstance(stats, tuple):
+                for s in stats:
+                    l, r = extract_metrics(s)
+                    if l is not None: loss_val = l
+                    if r is not None: reward_val = r
+            
+            # Fallbacks just in case the stats dict is empty or differently structured
+            history["loss"].append(loss_val if loss_val is not None else 0.0)
+            history["reward"].append(reward_val if reward_val is not None else 0.0)
+
+            # Generate dynamically updating training plot
+            try:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(10, 4))
+                
+                plt.subplot(1, 2, 1)
+                plt.plot(range(len(history["loss"])), history["loss"], label="Loss", color="red")
+                plt.xlabel("Epoch")
+                plt.ylabel("Loss")
+                plt.title("Training Loss")
+                plt.grid(True)
+                
+                plt.subplot(1, 2, 2)
+                plt.plot(range(len(history["reward"])), history["reward"], label="Reward", color="green")
+                plt.xlabel("Epoch")
+                plt.ylabel("Reward")
+                plt.title("Diverse Turing Rewards")
+                plt.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig("./working/training_progress.png")
+                plt.close()
+            except Exception as e:
+                print(f"   [Warning] Failed to generate plot: {e}")
             
             # Checkpoint roughly every 5 epochs
             if (epoch + 1) % 5 == 0:
@@ -291,9 +345,9 @@ def main():
         trainer.save_pretrained(CHECKPOINT_DIR)
         # 2. Save accelerator state (Optimizers, Schedulers, RNG)
         trainer.accelerator.save_state(CHECKPOINT_DIR)
-        # 3. Save our manual loop epoch metadata
+        # 3. Save our manual loop epoch metadata & history
         with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "w") as f:
-            json.dump({"epoch": epoch}, f)
+            json.dump({"epoch": epoch, "history": history}, f)
         print(f">> State seamlessly saved at Epoch {epoch}. You can re-run this cell to resume.")
         return # Exit the main function early, entirely skipping final push since we are "paused"
 
