@@ -210,8 +210,8 @@ def run_sanity_checks():
         assert pat.shape == (4, 3, 512, 512)
         dist = pairwise_hamming_distance(pat)
         assert dist.shape == (4,) and torch.all(dist >= 0) and torch.all(dist <= 1.0)
-        os.makedirs("./working", exist_ok=True)
-        T.ToPILImage()(pat[0]).save("./working/preflight_check.png")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        T.ToPILImage()(pat[0]).save(os.path.join(OUTPUT_DIR, "preflight_check.png"))
         print("   Preflight checks passed!")
         print("--------------------------------------------------\n")
     except Exception as e:
@@ -245,11 +245,24 @@ def prompt_fn():
         return next(prompt_iterator), {}
 
 
+# Output directory: /kaggle/working/ persists after committed runs
+OUTPUT_DIR = "/kaggle/working" if "KAGGLE_URL_BASE" in os.environ else "./working"
+
 # =============================================================================
 # 6. Main DDPO Training Loop — From Scratch, No trl
 # =============================================================================
 
+def _save_state(pipeline, optimizer, epoch, history, checkpoint_dir):
+    """Saves LoRA weights, optimizer, and metadata to checkpoint_dir."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
+    torch.save(lora_state, os.path.join(checkpoint_dir, "unet_lora.pt"))
+    torch.save(optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
+    with open(os.path.join(checkpoint_dir, "state_meta.json"), "w") as f:
+        json.dump({"epoch": epoch, "history": history}, f)
+
 def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     run_sanity_checks()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -299,10 +312,11 @@ def main():
     ADV_CLIP           = 5.0
 
     # ── Time-Aware + Resume ──────────────────────────────────────────────
-    MAX_RUNTIME_SECONDS = (28.0 - 0.25) * 3600
+    # Kaggle committed GPU runs have a 9hr limit. Stop at 8.5hrs to save.
+    MAX_RUNTIME_SECONDS = (8.5 - 0.25) * 3600  # 8.25 hrs effective
     START_TIME = time.time()
 
-    CHECKPOINT_DIR = "./working/checkpoint_latest"
+    CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoint_latest")
     start_epoch = 0
     history = {"loss": [], "reward": []}
 
@@ -331,7 +345,7 @@ def main():
     ).input_ids.to(device)
     neg_embeds = pipeline.text_encoder(neg_ids)[0]
 
-    print(f">> Starting DDPO Loop. Max runtime: 27.75 hrs.")
+    print(f">> Starting DDPO Loop. Max runtime: 8.25 hrs (Kaggle committed).")
 
     # ── Training Loop ────────────────────────────────────────────────────
     try:
@@ -440,38 +454,40 @@ def main():
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
                 ax1.plot(history["loss"], color="red"); ax1.set_title("Training Loss"); ax1.set_xlabel("Epoch"); ax1.grid(True)
                 ax2.plot(history["reward"], color="green"); ax2.set_title("Turing Reward"); ax2.set_xlabel("Epoch"); ax2.grid(True)
-                plt.tight_layout(); plt.savefig("./working/training_progress.png"); plt.close()
+                plt.tight_layout(); plt.savefig(os.path.join(OUTPUT_DIR, "training_progress.png")); plt.close()
             except Exception as e:
                 print(f"   [Warning] Plot failed: {e}")
 
             # ══════════ PHASE 4: PERIODIC CHECKPOINT ══════════
-            if (epoch + 1) % 5 == 0:
-                ckpt = f"./working/ddpo_epoch_{epoch}"
-                os.makedirs(ckpt, exist_ok=True)
-                lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
-                torch.save(lora_state, os.path.join(ckpt, "unet_lora.pt"))
-                print(f"   Checkpoint -> {ckpt}")
+            if (epoch + 1) % 10 == 0:
+                _save_state(pipeline, optimizer, epoch, history, CHECKPOINT_DIR)
+                print(f"   Checkpoint saved at Epoch {epoch}")
 
     except KeyboardInterrupt:
-        print("\n>> Stop button pressed! Saving state...")
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
-        torch.save(lora_state, os.path.join(CHECKPOINT_DIR, "unet_lora.pt"))
-        torch.save(optimizer.state_dict(), os.path.join(CHECKPOINT_DIR, "optimizer.pt"))
-        with open(os.path.join(CHECKPOINT_DIR, "state_meta.json"), "w") as f:
-            json.dump({"epoch": epoch, "history": history}, f)
-        print(f">> Paused at Epoch {epoch}. Re-run this cell to resume.")
-        return
+        print("\n>> Stop button pressed!")
 
     finally:
-        pass
+        # ALWAYS save state — whether time-limit, interrupt, or error.
+        # This guarantees outputs persist in /kaggle/working/ after committed runs.
+        print(">> Saving final state...")
+        _save_state(pipeline, optimizer, epoch, history, CHECKPOINT_DIR)
 
-    # Final save
-    final = f"./working/ddpo_final_{int(time.time())}"
-    os.makedirs(final, exist_ok=True)
-    lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
-    torch.save(lora_state, os.path.join(final, "unet_lora.pt"))
-    print(f">> Done! Final LoRA saved to {final}")
+        # Also save a clean copy of just the LoRA weights
+        final_dir = os.path.join(OUTPUT_DIR, "ddpo_final")
+        os.makedirs(final_dir, exist_ok=True)
+        lora_state = {k: v.cpu() for k, v in pipeline.unet.state_dict().items() if "lora" in k.lower()}
+        torch.save(lora_state, os.path.join(final_dir, "unet_lora.pt"))
+
+        # Save training history as standalone JSON
+        with open(os.path.join(OUTPUT_DIR, "training_history.json"), "w") as f:
+            json.dump({"epoch": epoch, "history": history}, f)
+
+        print(f">> All outputs saved to {OUTPUT_DIR}:")
+        print(f"   - checkpoint_latest/  (resume state)")
+        print(f"   - ddpo_final/         (final LoRA weights)")
+        print(f"   - training_progress.png")
+        print(f"   - training_history.json")
+        print(f"   Total epochs completed: {epoch + 1}")
 
 if __name__ == "__main__":
     main()
