@@ -168,19 +168,38 @@ def sample_with_logprob(pipeline, prompt_embeds, neg_prompt_embeds, num_steps, g
 #    - Pairwise Hamming distance rewards DIVERSITY across same-prompt generations
 # =============================================================================
 
-def turing_pattern_blur_sharpen(images, iterations=5, blur_sigma=2.0,
-                                sharpen_strength=1.5, threshold=0.5):
+def _rgb_to_lab_L(images):
+    """Converts RGB tensor (B,3,H,W) in [0,1] to LAB L-channel (B,1,H,W) in [0,1]."""
+    # Step 1: sRGB gamma → linear RGB
+    linear = torch.where(images <= 0.04045, images / 12.92,
+                         ((images + 0.055) / 1.055) ** 2.4)
+    r, g, b = linear[:, 0:1], linear[:, 1:2], linear[:, 2:3]
+
+    # Step 2: Linear RGB → CIE XYZ (Y = luminance)
+    Y = 0.2126 * r + 0.7152 * g + 0.0722 * b  # (B, 1, H, W)
+
+    # Step 3: XYZ Y → LAB L*
+    # L* = 116 * f(Y/Yn) - 16, where Yn=1.0 (D65)
+    fy = torch.where(Y > 0.008856, Y ** (1.0 / 3.0), 7.787 * Y + 16.0 / 116.0)
+    L = 116.0 * fy - 16.0  # Range [0, 100]
+
+    return L / 100.0  # Normalize to [0, 1]
+
+def turing_pattern_blur_sharpen(images, iterations=5, blur_radius=2,
+                                sharpen_strength=1.0, threshold=0.5):
     """
     Extracts Turing-like patterns via iterative blur-sharpen cycles.
-    Blur = diffusion, Sharpen = reaction. Repeated cycles amplify
-    periodic spatial patterns characteristic of Turing instabilities.
+    Uses LAB L-channel (perceptual luminosity), blur radius 2, medium sharpen.
     """
-    # Convert to grayscale for pattern analysis
-    gray = images.mean(dim=1, keepdim=True)  # (B, 1, H, W)
-    x = gray.clone()
+    # Extract perceptual luminosity via LAB L-channel
+    x = _rgb_to_lab_L(images)  # (B, 1, H, W) in [0, 1]
+
+    kernel_size = blur_radius * 2 + 1  # radius 2 → kernel 5x5
+    sigma = blur_radius * 0.5 + 0.5    # sigma matched to radius
 
     for _ in range(iterations):
-        blurred = TF.gaussian_blur(x, kernel_size=[11, 11], sigma=[blur_sigma, blur_sigma])
+        blurred = TF.gaussian_blur(x, kernel_size=[kernel_size, kernel_size],
+                                   sigma=[sigma, sigma])
         x = x + sharpen_strength * (x - blurred)   # unsharp mask (reaction)
         x = x.clamp(0, 1)
 
