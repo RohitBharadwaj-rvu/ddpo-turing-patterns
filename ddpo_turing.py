@@ -185,7 +185,7 @@ def _rgb_to_lab_L(images):
 
     return L / 100.0  # Normalize to [0, 1]
 
-def turing_pattern_blur_sharpen(images, iterations=5, blur_radius=2,
+def turing_pattern_blur_sharpen(images, iterations=150, blur_radius=2,
                                 sharpen_strength=1.0, threshold=0.5):
     """
     Extracts Turing-like patterns via iterative blur-sharpen cycles.
