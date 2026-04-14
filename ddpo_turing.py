@@ -163,15 +163,33 @@ def sample_with_logprob(pipeline, prompt_embeds, neg_prompt_embeds, num_steps, g
 
 
 # =============================================================================
-# 3. Turing Pattern & Custom Reward Functions (UNCHANGED)
+# 3. Turing Pattern & Custom Reward Functions
+#    - Blur-Sharpen cycle (reaction-diffusion) for pattern extraction
+#    - Pairwise Hamming distance rewards DIVERSITY across same-prompt generations
 # =============================================================================
 
-def turing_pattern_dog(images, sigma_1=1.0, sigma_2=2.0, threshold=0.0):
-    blur_1 = TF.gaussian_blur(images, kernel_size=[11, 11], sigma=[sigma_1, sigma_1])
-    blur_2 = TF.gaussian_blur(images, kernel_size=[21, 21], sigma=[sigma_2, sigma_2])
-    return (blur_1 - blur_2 > threshold).float()
+def turing_pattern_blur_sharpen(images, iterations=5, blur_sigma=2.0,
+                                sharpen_strength=1.5, threshold=0.5):
+    """
+    Extracts Turing-like patterns via iterative blur-sharpen cycles.
+    Blur = diffusion, Sharpen = reaction. Repeated cycles amplify
+    periodic spatial patterns characteristic of Turing instabilities.
+    """
+    # Convert to grayscale for pattern analysis
+    gray = images.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+    x = gray.clone()
+
+    for _ in range(iterations):
+        blurred = TF.gaussian_blur(x, kernel_size=[11, 11], sigma=[blur_sigma, blur_sigma])
+        x = x + sharpen_strength * (x - blurred)   # unsharp mask (reaction)
+        x = x.clamp(0, 1)
+
+    # Binarize to extract clean pattern structure
+    pattern = (x > threshold).float()
+    return pattern
 
 def pairwise_hamming_distance(patterns):
+    """Rewards images whose patterns are MOST DIFFERENT from each other."""
     B = patterns.shape[0]
     if B < 2:
         return torch.tensor(0.0, device=patterns.device).expand(B)
@@ -183,12 +201,13 @@ def pairwise_hamming_distance(patterns):
     return rewards
 
 def custom_reward_fn(images, prompts, metadata):
+    """All images share the SAME prompt. Reward = diversity + balance."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     to_tensor = T.ToTensor()
     if not isinstance(images, list):
         images = [images]
     batch = torch.stack([to_tensor(img) for img in images]).to(device)
-    patterns = turing_pattern_dog(batch)
+    patterns = turing_pattern_blur_sharpen(batch)
     diversity = pairwise_hamming_distance(patterns)
     means = patterns.view(batch.shape[0], -1).mean(dim=1)
     balance = 1.0 - torch.abs(means - 0.5) * 2.0
@@ -206,8 +225,8 @@ def run_sanity_checks():
     print(f"   Detected device: {device}")
     try:
         dummy = torch.rand(4, 3, 512, 512, device=device)
-        pat = turing_pattern_dog(dummy)
-        assert pat.shape == (4, 3, 512, 512)
+        pat = turing_pattern_blur_sharpen(dummy)
+        assert pat.shape == (4, 1, 512, 512), f"Expected (4,1,512,512) got {pat.shape}"
         dist = pairwise_hamming_distance(pat)
         assert dist.shape == (4,) and torch.all(dist >= 0) and torch.all(dist <= 1.0)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -303,8 +322,8 @@ def main():
 
     # ── Hyperparameters ──────────────────────────────────────────────────
     NUM_EPOCHS         = 1000
-    SAMPLE_BATCH_SIZE  = 2
-    BATCHES_PER_EPOCH  = 4
+    SAMPLE_BATCH_SIZE  = 4     # Generate 4 images of the SAME prompt per batch
+    BATCHES_PER_EPOCH  = 4     # 4 different prompts per epoch, 4 images each = 16 total
     NUM_STEPS          = 20    # DDIM denoising steps
     GUIDANCE_SCALE     = 5.0
     ETA                = 1.0   # Must be >0 for valid log probs
@@ -363,7 +382,9 @@ def main():
             all_rewards_list = []
 
             for batch_idx in range(BATCHES_PER_EPOCH):
-                prompts = [prompt_fn()[0] for _ in range(SAMPLE_BATCH_SIZE)]
+                # ALL images in this batch share the SAME prompt
+                single_prompt = prompt_fn()[0]
+                prompts = [single_prompt] * SAMPLE_BATCH_SIZE
 
                 prompt_ids = pipeline.tokenizer(
                     prompts, return_tensors="pt", padding="max_length",
