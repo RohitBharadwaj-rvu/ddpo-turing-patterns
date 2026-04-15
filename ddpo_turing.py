@@ -289,6 +289,7 @@ OUTPUT_DIR = "/kaggle/working" if "KAGGLE_URL_BASE" in os.environ else "./workin
 # Optional paths to resume from specific files (e.g. uploaded previously to Kaggle as a dataset)
 LORA_RESUME_PATH = "/kaggle/input/ddpo-lora-state/unet_lora.pt"
 META_RESUME_PATH = "/kaggle/input/ddpo-lora-state/state_meta.json"
+OPT_RESUME_PATH  = "/kaggle/input/ddpo-lora-state/optimizer.pt"
 
 # Auto-discovery: If you uploaded the files to Kaggle, we automatically find them in /kaggle/input/
 if "KAGGLE_URL_BASE" in os.environ:
@@ -301,6 +302,11 @@ if "KAGGLE_URL_BASE" in os.environ:
         for root, _, files in os.walk("/kaggle/input/"):
             if "state_meta.json" in files:
                 META_RESUME_PATH = os.path.join(root, "state_meta.json")
+                break
+    if not os.path.exists(OPT_RESUME_PATH):
+        for root, _, files in os.walk("/kaggle/input/"):
+            if "optimizer.pt" in files:
+                OPT_RESUME_PATH = os.path.join(root, "optimizer.pt")
                 break
 
 # =============================================================================
@@ -396,15 +402,19 @@ def main():
         try:
             pipeline.unet.load_state_dict(torch.load(LORA_RESUME_PATH, map_location=device), strict=False)
             print("   Loaded custom LoRA weights.")
+            if os.path.exists(OPT_RESUME_PATH):
+                print(f">> Found custom Optimizer resume file at {OPT_RESUME_PATH}.")
+                optimizer.load_state_dict(torch.load(OPT_RESUME_PATH, map_location=device))
+                print("   Loaded custom Optimizer state.")
             if os.path.exists(META_RESUME_PATH):
                 print(f">> Found custom Meta resume file at {META_RESUME_PATH}.")
                 with open(META_RESUME_PATH, "r") as f:
                     meta = json.load(f)
-                    start_epoch = meta.get("epoch", 136) + 1
+                    start_epoch = meta.get("epoch", 0) + 1
                     history = meta.get("history", {"loss": [], "reward": []})
                 print(f"   Resumed metadata from Epoch {start_epoch}.")
         except Exception as e:
-            print(f"   Failed to load custom LoRA/Meta: {e}. Starting fresh.")
+            print(f"   Failed to load custom LoRA/Meta/Optimizer: {e}. Starting fresh.")
 
     # Pre-compute negative prompt embeddings (empty string)
     neg_ids = pipeline.tokenizer(
