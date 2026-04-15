@@ -286,6 +286,23 @@ def prompt_fn():
 # Output directory: /kaggle/working/ persists after committed runs
 OUTPUT_DIR = "/kaggle/working" if "KAGGLE_URL_BASE" in os.environ else "./working"
 
+# Optional paths to resume from specific files (e.g. uploaded previously to Kaggle as a dataset)
+LORA_RESUME_PATH = "/kaggle/input/ddpo-lora-state/unet_lora.pt"
+META_RESUME_PATH = "/kaggle/input/ddpo-lora-state/state_meta.json"
+
+# Auto-discovery: If you uploaded the files to Kaggle, we automatically find them in /kaggle/input/
+if "KAGGLE_URL_BASE" in os.environ:
+    if not os.path.exists(LORA_RESUME_PATH):
+        for root, _, files in os.walk("/kaggle/input/"):
+            if "unet_lora.pt" in files:
+                LORA_RESUME_PATH = os.path.join(root, "unet_lora.pt")
+                break
+    if not os.path.exists(META_RESUME_PATH):
+        for root, _, files in os.walk("/kaggle/input/"):
+            if "state_meta.json" in files:
+                META_RESUME_PATH = os.path.join(root, "state_meta.json")
+                break
+
 # =============================================================================
 # 6. Main DDPO Training Loop — From Scratch, No trl
 # =============================================================================
@@ -358,7 +375,7 @@ def main():
     start_epoch = 0
     history = {"loss": [], "reward": []}
 
-    if os.path.exists(CHECKPOINT_DIR):
+    if os.path.exists(CHECKPOINT_DIR) and os.path.exists(os.path.join(CHECKPOINT_DIR, "unet_lora.pt")):
         print(f">> Found checkpoint at {CHECKPOINT_DIR}. Resuming...")
         try:
             lora_path = os.path.join(CHECKPOINT_DIR, "unet_lora.pt")
@@ -374,6 +391,20 @@ def main():
             print(f"   Resumed from Epoch {start_epoch}.")
         except Exception as e:
             print(f"   Failed to load checkpoint: {e}. Starting fresh.")
+    elif os.path.exists(LORA_RESUME_PATH):
+        print(f">> Found custom LoRA resume file at {LORA_RESUME_PATH}. Resuming...")
+        try:
+            pipeline.unet.load_state_dict(torch.load(LORA_RESUME_PATH, map_location=device), strict=False)
+            print("   Loaded custom LoRA weights.")
+            if os.path.exists(META_RESUME_PATH):
+                print(f">> Found custom Meta resume file at {META_RESUME_PATH}.")
+                with open(META_RESUME_PATH, "r") as f:
+                    meta = json.load(f)
+                    start_epoch = meta.get("epoch", 136) + 1
+                    history = meta.get("history", {"loss": [], "reward": []})
+                print(f"   Resumed metadata from Epoch {start_epoch}.")
+        except Exception as e:
+            print(f"   Failed to load custom LoRA/Meta: {e}. Starting fresh.")
 
     # Pre-compute negative prompt embeddings (empty string)
     neg_ids = pipeline.tokenizer(

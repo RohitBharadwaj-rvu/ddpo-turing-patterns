@@ -206,6 +206,23 @@ def custom_reward_fn(images, prompts, metadata):
 
 OUTPUT_DIR = "/kaggle/working" if "KAGGLE_URL_BASE" in os.environ else "./working"
 
+# Optional paths to resume from specific files (e.g. uploaded previously to Kaggle as a dataset)
+LORA_RESUME_PATH = "/kaggle/input/ddpo-lora-state/unet_lora.pt"
+META_RESUME_PATH = "/kaggle/input/ddpo-lora-state/state_meta.json"
+
+# Auto-discovery: If you uploaded the files to Kaggle, we automatically find them in /kaggle/input/
+if "KAGGLE_URL_BASE" in os.environ:
+    if not os.path.exists(LORA_RESUME_PATH):
+        for root, _, files in os.walk("/kaggle/input/"):
+            if "unet_lora.pt" in files:
+                LORA_RESUME_PATH = os.path.join(root, "unet_lora.pt")
+                break
+    if not os.path.exists(META_RESUME_PATH):
+        for root, _, files in os.walk("/kaggle/input/"):
+            if "state_meta.json" in files:
+                META_RESUME_PATH = os.path.join(root, "state_meta.json")
+                break
+
 def run_sanity_checks():
     print("--------------------------------------------------")
     print(">> Running preflight sanity checks...")
@@ -283,6 +300,14 @@ def main():
 
     trainable_params = [p for p in pipeline.unet.parameters() if p.requires_grad]
     print(f"   Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    if os.path.exists(LORA_RESUME_PATH):
+        print(f">> Found custom LoRA resume file at {LORA_RESUME_PATH}. Resuming...")
+        try:
+            pipeline.unet.load_state_dict(torch.load(LORA_RESUME_PATH, map_location=device), strict=False)
+            print("   Loaded custom LoRA weights.")
+        except Exception as e:
+            print(f"   Failed to load custom LoRA: {e}. Starting fresh.")
 
     try:
         import bitsandbytes as bnb
