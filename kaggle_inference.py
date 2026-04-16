@@ -52,17 +52,6 @@ def main():
     images_per_prompt = 2
     os.makedirs("/kaggle/working/outputs", exist_ok=True)
 
-    print("\n>> PHASE 1: Generating Vanilla (No LoRA) Images...")
-    if is_tpu:
-        print("   [!] NOTE: The first generation on TPU will take ~3-5 minutes because PyTorch XLA has to compile the Diffusers execution graph. Subsequent generations will be extremely fast.")
-
-    vanilla_results = []
-    for i, prompt in enumerate(prompts):
-        print(f"   [Vanilla] Prompt {i+1}: '{prompt}'")
-        batch_prompts = [prompt] * images_per_prompt
-        images = pipeline(batch_prompts, num_inference_steps=30, guidance_scale=6.0).images
-        vanilla_results.append(images)
-
     print("\n>> Configuring LoRA Architecture...")
     lora_config = LoraConfig(
         r=4, lora_alpha=4, init_lora_weights="gaussian",
@@ -88,39 +77,37 @@ def main():
         pipeline.unet.load_state_dict(torch.load(lora_path, map_location="cpu"), strict=False)
         print("   ✅ LoRA weights loaded successfully!")
     else:
-        print("   ❌ WARNING: Could not find unet_lora.pt! Phase 2 will just be vanilla again.")
+        print("   ❌ WARNING: Could not find unet_lora.pt! Generating with vanilla model.")
 
     if is_tpu:
         pipeline = pipeline.to(device)
 
-    print("\n>> PHASE 2: Generating LoRA Images...")
-    lora_results = []
-    for i, prompt in enumerate(prompts):
-        print(f"   [LoRA]    Prompt {i+1}: '{prompt}'")
-        batch_prompts = [prompt] * images_per_prompt
-        images = pipeline(batch_prompts, num_inference_steps=30, guidance_scale=6.0).images
-        lora_results.append(images)
+    print(f"\n>> Starting Inference (2 images per prompt)...")
+    if is_tpu:
+        print("   [!] NOTE: The first generation on TPU will take ~3-5 minutes because PyTorch XLA has to compile the Diffusers execution graph. Subsequent generations will be extremely fast.")
 
-    print("\n>> Plotting Results (Vanilla vs LoRA)...")
     for i, prompt in enumerate(prompts):
-        # 4 images total (2 vanilla + 2 lora)
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        print(f"   Prompt {i+1}: '{prompt}'")
         
-        # Vanilla
-        for j, img in enumerate(vanilla_results[i]):
-            out_path = f"/kaggle/working/outputs/prompt_{i+1}_vanilla_{j+1}.png"
+        # We generate 2 images by sending a list of the same prompt 2 times
+        batch_prompts = [prompt] * images_per_prompt
+        
+        # Generate
+        images = pipeline(
+            batch_prompts, 
+            num_inference_steps=30, 
+            guidance_scale=6.0,
+        ).images
+
+        # Save and display
+        fig, axes = plt.subplots(1, images_per_prompt, figsize=(10, 5))
+        for j, img in enumerate(images):
+            out_path = f"/kaggle/working/outputs/prompt_{i+1}_img_{j+1}.png"
             img.save(out_path)
+            
             axes[j].imshow(img)
             axes[j].axis('off')
-            axes[j].set_title(f"Vanilla Gen {j+1}")
-            
-        # LoRA
-        for j, img in enumerate(lora_results[i]):
-            out_path = f"/kaggle/working/outputs/prompt_{i+1}_lora_{j+1}.png"
-            img.save(out_path)
-            axes[j+2].imshow(img)
-            axes[j+2].axis('off')
-            axes[j+2].set_title(f"LoRA Gen {j+1}")
+            axes[j].set_title(f"Gen {j+1}")
             
         plt.suptitle(f"Prompt: {prompt}")
         plt.tight_layout()
